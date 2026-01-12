@@ -78,22 +78,24 @@ pub async fn handle_connect_mode(addr: &str, path: &Path) -> anyhow::Result<()> 
             .unwrap()
             .progress_chars("#>-"),
         );
+    let file_id = OsRng.try_next_u64().context("无法生成随机数")?;
     loop {
         let download_range = match invert(progress.iter(), meta.size).next() {
             None => break,
             Some(r) => r,
         };
-        let fid = OsRng.try_next_u64().context("无法生成随机数")?;
+        let action_id = OsRng.try_next_u64().context("无法生成随机数")?;
         let event = bitcode::encode(&Event::File(FileRequest {
             path: path_str.clone(),
             start: download_range.start,
             end: download_range.end,
-            fid,
+            file_id,
+            action_id,
         }));
         loop {
             match client.send(&mut event.clone()).await {
                 Err(e) => tracing::warn!("获取文件内容失败：{:?}", e),
-                Ok(_) => match get_file(&client, &mut buf, fid).await {
+                Ok(_) => match get_file(&client, &mut buf, file_id).await {
                     Err(e) => tracing::warn!("获取文件内容失败：{:?}", e),
                     Ok(None) => {}
                     Ok(Some(part)) => {
@@ -110,7 +112,7 @@ pub async fn handle_connect_mode(addr: &str, path: &Path) -> anyhow::Result<()> 
             if progress.iter().any(|p| p.contain(&download_range)) {
                 break;
             }
-            match tokio::time::timeout(Duration::from_secs(1), get_file(&client, &mut buf, fid))
+            match tokio::time::timeout(Duration::from_secs(1), get_file(&client, &mut buf, file_id))
                 .await
             {
                 Err(e) => {
@@ -136,7 +138,7 @@ pub async fn handle_connect_mode(addr: &str, path: &Path) -> anyhow::Result<()> 
 async fn get_file<C: Crypto>(
     client: &Client<C>,
     buf: &mut Vec<u8>,
-    fid: u64,
+    file_id: u64,
 ) -> anyhow::Result<Option<FilePart>> {
     let res = client.recv(buf).await.context("接收文件内容失败")?;
     if res.is_none() {
@@ -144,9 +146,13 @@ async fn get_file<C: Crypto>(
     }
     let event: Event = bitcode::decode(buf).context("解码文件内容失败")?;
     match event {
-        Event::AckFile(part) if part.fid == fid => Ok(Some(part)),
+        Event::AckFile(part) if part.file_id == file_id => Ok(Some(part)),
         Event::AckFile(part) => {
-            anyhow::bail!("收到错误的 AckFile，期望 fid: {} 但收到：{}", fid, part.fid)
+            anyhow::bail!(
+                "收到错误的 AckFile，期望 file_id: {} 但收到：{}",
+                file_id,
+                part.file_id
+            )
         }
         event => anyhow::bail!("期望收到文件内容 AckFile，但收到：{:?}", event),
     }
@@ -154,10 +160,9 @@ async fn get_file<C: Crypto>(
 ```
 
 ```rs title="fsend\src\lib.rs"
-use std::net::SocketAddr;
-
 use bitcode::{Decode, Encode};
 use socket2::{Domain, Protocol, Socket, Type};
+use std::net::SocketAddr;
 
 pub mod client;
 pub mod progress;
@@ -187,14 +192,16 @@ pub struct FileRequest {
     pub start: u64,
     /// 不包含 end
     pub end: u64,
-    pub fid: u64,
+    pub file_id: u64,
+    pub action_id: u64,
 }
 
 #[derive(Encode, Decode, PartialEq, Debug, Clone)]
 pub struct FilePart {
     pub data: Vec<u8>,
     pub start: u64,
-    pub fid: u64,
+    pub file_id: u64,
+    pub action_id: u64,
 }
 
 pub fn build_socket(addr: SocketAddr) -> std::io::Result<tokio::net::UdpSocket> {
@@ -286,6 +293,7 @@ use cscall::{
     crypto::{Crypto, nocrypto::NoCrypto},
     server::Server,
 };
+use dashmap::DashSet;
 use mmap_io::{MemoryMappedFile, MmapAdvice, MmapMode};
 use std::{
     path::{Path, PathBuf},
@@ -302,6 +310,7 @@ pub async fn handle_serve_mode(serve_root: &Path) -> anyhow::Result<()> {
     let pwd = rpassword::prompt_password("请输入密码：")?;
     let socket = Arc::new(build_socket("0.0.0.0:8080".parse()?)?);
     let server = Arc::new(Server::<NoCrypto>::new(pwd.as_bytes(), socket).await?);
+    let action_ids = Arc::new(DashSet::new());
     tracing::info!("服务器启动，服务目录: {}", serve_root.display());
     let mut buf = Vec::with_capacity(1500);
     loop {
@@ -318,8 +327,11 @@ pub async fn handle_serve_mode(serve_root: &Path) -> anyhow::Result<()> {
                 Ok(event) => {
                     let server_clone = server.clone();
                     let root_clone = serve_root.clone();
+                    let action_ids = action_ids.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = handle_request(server_clone, uid, root_clone, event).await {
+                        if let Err(e) =
+                            handle_request(server_clone, uid, root_clone, event, action_ids).await
+                        {
                             tracing::error!(
                                 "处理请求失败 (UID: {}, Count: {}): {:?}",
                                 hex::encode(uid),
@@ -340,6 +352,7 @@ async fn handle_request<C: Crypto>(
     uid: [u8; UID_LEN],
     root: Arc<PathBuf>,
     event: Event,
+    action_ids: Arc<DashSet<u64>>,
 ) -> anyhow::Result<()> {
     let client = server.get(&uid).await.context("找不到客户端连接")?;
     match event {
@@ -356,12 +369,20 @@ async fn handle_request<C: Crypto>(
         }
         Event::File(req) => {
             tracing::info!(
-                "收到文件请求: {} ({}) [{}, {})",
+                "收到文件请求: {} ({})({}) [{}, {})",
                 req.path,
-                req.fid,
+                req.file_id,
+                req.action_id,
                 req.start,
                 req.end
             );
+            if action_ids.contains(&req.action_id) {
+                anyhow::bail!("重复的 action_id")
+            }
+            action_ids.insert(req.action_id);
+            let _ids_guard = scopeguard::guard((), |_| {
+                action_ids.remove(&req.action_id);
+            });
             let path = secure_resolve_path(&root, &req.path).await?;
             let file_size = fs::metadata(&path).await?.len();
             if file_size == 0 {
@@ -385,7 +406,8 @@ async fn handle_request<C: Crypto>(
                         .as_slice(curr_pos, len)
                         .context("无法读取文件")?
                         .to_vec(),
-                    fid: req.fid,
+                    file_id: req.file_id,
+                    action_id: req.action_id,
                 };
                 let response = Event::AckFile(part);
                 while let Err(e) = client.send(&mut bitcode::encode(&response)).await {

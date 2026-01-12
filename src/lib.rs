@@ -1,7 +1,6 @@
-use std::net::SocketAddr;
-
 use bitcode::{Decode, Encode};
 use socket2::{Domain, Protocol, Socket, Type};
+use std::net::SocketAddr;
 
 pub mod client;
 pub mod progress;

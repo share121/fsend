@@ -126,7 +126,8 @@ pub async fn handle_connect_mode(addr: &str, path: &Path) -> anyhow::Result<()> 
             }
         }
     }
-    pb.finish_with_message("下载完成，等待写入线程");
+    pb.finish();
+    tracing::info!("下载完成，等待写入线程");
     drop(tx);
     write_handle.await.context("写入线程异常退出")?;
     Ok(())

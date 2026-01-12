@@ -5,6 +5,7 @@ use cscall::{
     crypto::{Crypto, nocrypto::NoCrypto},
     server::Server,
 };
+use dashmap::DashSet;
 use mmap_io::{MemoryMappedFile, MmapAdvice, MmapMode};
 use std::{
     path::{Path, PathBuf},
@@ -21,6 +22,7 @@ pub async fn handle_serve_mode(serve_root: &Path) -> anyhow::Result<()> {
     let pwd = rpassword::prompt_password("请输入密码：")?;
     let socket = Arc::new(build_socket("0.0.0.0:8080".parse()?)?);
     let server = Arc::new(Server::<NoCrypto>::new(pwd.as_bytes(), socket).await?);
+    let fids = Arc::new(DashSet::new());
     tracing::info!("服务器启动，服务目录: {}", serve_root.display());
     let mut buf = Vec::with_capacity(1500);
     loop {
@@ -37,8 +39,11 @@ pub async fn handle_serve_mode(serve_root: &Path) -> anyhow::Result<()> {
                 Ok(event) => {
                     let server_clone = server.clone();
                     let root_clone = serve_root.clone();
+                    let fids = fids.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = handle_request(server_clone, uid, root_clone, event).await {
+                        if let Err(e) =
+                            handle_request(server_clone, uid, root_clone, event, fids).await
+                        {
                             tracing::error!(
                                 "处理请求失败 (UID: {}, Count: {}): {:?}",
                                 hex::encode(uid),
@@ -59,6 +64,7 @@ async fn handle_request<C: Crypto>(
     uid: [u8; UID_LEN],
     root: Arc<PathBuf>,
     event: Event,
+    fids: Arc<DashSet<u64>>,
 ) -> anyhow::Result<()> {
     let client = server.get(&uid).await.context("找不到客户端连接")?;
     match event {
@@ -81,6 +87,13 @@ async fn handle_request<C: Crypto>(
                 req.start,
                 req.end
             );
+            if fids.contains(&req.fid) {
+                anyhow::bail!("重复的 fid")
+            }
+            fids.insert(req.fid);
+            let _ids_guard = scopeguard::guard((), |_| {
+                fids.remove(&req.fid);
+            });
             let path = secure_resolve_path(&root, &req.path).await?;
             let file_size = fs::metadata(&path).await?.len();
             if file_size == 0 {
