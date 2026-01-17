@@ -4,12 +4,12 @@ use crate::{
 };
 use anyhow::Context;
 use cscall::{
-    client::Client,
-    crypto::{Crypto, nocrypto::NoCrypto},
+    client::{Client, ClientConfig},
+    crypto::{Crypto, aes256gcm::Aes256GcmCrypto},
 };
 use indicatif::{ProgressBar, ProgressStyle};
-use mmap_io::{MemoryMappedFile, MmapMode, flush::FlushPolicy};
-use rand::{TryRngCore, rngs::OsRng};
+use mmap_io::{MemoryMappedFile, MmapMode};
+use rand::{RngCore, rngs::OsRng};
 use std::{net::SocketAddr, path::Path, sync::Arc, time::Duration};
 
 pub async fn handle_connect_mode(addr: &str, path: &Path) -> anyhow::Result<()> {
@@ -18,8 +18,13 @@ pub async fn handle_connect_mode(addr: &str, path: &Path) -> anyhow::Result<()> 
     let pwd = rpassword::prompt_password("请输入密码：")?;
     let socket = Arc::new(build_socket("0.0.0.0:0".parse()?)?);
     let client = tokio::time::timeout(
-        Duration::from_secs(10),
-        Client::<NoCrypto>::new(pwd.into_bytes(), addr, socket),
+        Duration::from_secs(30),
+        Client::<Aes256GcmCrypto>::new(ClientConfig {
+            socket,
+            target: addr,
+            ttl: Duration::from_secs(10),
+            pwd: pwd.as_bytes().into(),
+        }),
     )
     .await
     .context("连接超时")?
@@ -47,7 +52,7 @@ pub async fn handle_connect_mode(addr: &str, path: &Path) -> anyhow::Result<()> 
     let mmap = MemoryMappedFile::builder(filename)
         .mode(MmapMode::ReadWrite)
         .size(meta.size)
-        .flush_policy(FlushPolicy::EveryBytes(256 * 1024))
+        .huge_pages(true)
         .create()?;
     let (tx, rx) = crossfire::spsc::unbounded_blocking::<FilePart>();
     let write_handle = tokio::task::spawn_blocking(move || {
@@ -82,7 +87,7 @@ pub async fn handle_connect_mode(addr: &str, path: &Path) -> anyhow::Result<()> 
             None => break,
             Some(r) => r,
         };
-        let fid = OsRng.try_next_u64().context("无法生成随机数")?;
+        let fid = OsRng.next_u64();
         let event = bitcode::encode(&Event::File(FileRequest {
             path: path_str.clone(),
             start: download_range.start,
@@ -130,6 +135,7 @@ pub async fn handle_connect_mode(addr: &str, path: &Path) -> anyhow::Result<()> 
     tracing::info!("下载完成，等待写入线程");
     drop(tx);
     write_handle.await.context("写入线程异常退出")?;
+    tracing::info!("写入完成");
     Ok(())
 }
 

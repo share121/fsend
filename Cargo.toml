@@ -9,13 +9,13 @@ anyhow = "1.0.100"
 bitcode = "0.6.7"
 clap = { version = "4.5.54", features = ["derive"] }
 crossfire = { version = "2.1.9", features = ["tokio"] }
-cscall = { path = "../kunvm/cscall" }
+cscall = { path = "../cscall" }
 dashmap = "6.1.0"
 hex = "0.4.3"
 indicatif = "0.18.3"
 mimalloc = "0.1.48"
-mmap-io = { version = "0.9.4", features = ["async"] }
-rand = "0.9.2"
+mmap-io = { version = "0.9.4", features = ["advise", "hugepages"], default-features = false }
+rand = "0.8"
 rpassword = "7.4.0"
 scopeguard = "1.2.0"
 socket2 = "0.6.1"

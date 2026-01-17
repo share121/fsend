@@ -2,7 +2,7 @@ use crate::{Event, FilePart, Metadata, build_socket};
 use anyhow::Context;
 use cscall::{
     UID_LEN,
-    crypto::{Crypto, nocrypto::NoCrypto},
+    crypto::{Crypto, aes256gcm::Aes256GcmCrypto},
     server::Server,
 };
 use dashmap::DashSet;
@@ -21,7 +21,7 @@ pub async fn handle_serve_mode(serve_root: &Path) -> anyhow::Result<()> {
     let serve_root = Arc::new(serve_root);
     let pwd = rpassword::prompt_password("请输入密码：")?;
     let socket = Arc::new(build_socket("0.0.0.0:8080".parse()?)?);
-    let server = Arc::new(Server::<NoCrypto>::new(pwd.as_bytes(), socket).await?);
+    let server = Arc::new(Server::<Aes256GcmCrypto>::new(pwd.as_bytes().into(), socket).await?);
     let fids = Arc::new(DashSet::new());
     tracing::info!("服务器启动，服务目录: {}", serve_root.display());
     let mut buf = Vec::with_capacity(1500);

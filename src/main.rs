@@ -1,6 +1,7 @@
 use clap::{CommandFactory, Parser, Subcommand};
 use fsend::{client::handle_connect_mode, server::handle_serve_mode};
 use std::path::PathBuf;
+use tracing::Level;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -15,6 +16,9 @@ struct Cli {
     /// 文件路径
     #[arg(short, long)]
     path: Option<PathBuf>,
+
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    verbose: u8, // -v, -vv, -vvv
 
     /// 子命令
     #[command(subcommand)]
@@ -33,15 +37,20 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+    let level = match cli.verbose {
+        0 => Level::INFO,
+        1 => Level::DEBUG,
+        _ => Level::TRACE,
+    };
     let subscriber = tracing_subscriber::fmt()
+        .with_max_level(level)
         .with_ansi(true)
         .with_file(true)
         .with_line_number(true)
         .with_target(false)
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
-
-    let cli = Cli::parse();
 
     if let Some(addr) = cli.connect
         && let Some(path) = cli.path
