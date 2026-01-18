@@ -23,7 +23,7 @@ pub async fn handle_connect_mode(addr: &str, path: &Path) -> anyhow::Result<()> 
         Client::<Aes256GcmCrypto>::new(ClientConfig {
             socket,
             target: addr,
-            ttl: Duration::from_secs(60),
+            ttl: Duration::from_secs(10),
             pwd: pwd.as_bytes().into(),
         }),
     )
@@ -169,7 +169,7 @@ async fn get_file<C: Crypto>(
         }
         Event::FileEnd(recv_file_id) => {
             tracing::warn!(
-                "收到错误的 FileEnd，期望 file_id: {} 但收到：{}",
+                "收到错误的 FileEnd，期望 file_id: {:x} 但收到：{:x}",
                 file_id,
                 recv_file_id
             );
@@ -177,7 +177,7 @@ async fn get_file<C: Crypto>(
         }
         Event::AckFile(part) => {
             tracing::warn!(
-                "收到错误的 AckFile，期望 file_id: {} 但收到：{}",
+                "收到错误的 AckFile，期望 file_id: {:x} 但收到：{:x}",
                 file_id,
                 part.file_id
             );

@@ -1,13 +1,14 @@
 use crate::{Event, FilePart, Metadata, build_socket};
 use anyhow::Context;
 use cscall::{
-    UID_LEN,
+    CsError, UID_LEN,
     crypto::{Crypto, aes256gcm::Aes256GcmCrypto},
     server::Server,
 };
 use dashmap::DashMap;
 use mmap_io::{MemoryMappedFile, MmapAdvice, MmapMode};
 use std::{
+    io::ErrorKind,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -27,7 +28,10 @@ pub async fn handle_serve_mode(serve_root: &Path) -> anyhow::Result<()> {
     let mut buf = Vec::with_capacity(1500);
     loop {
         match server.recv(&mut buf).await {
-            Err(e) => tracing::warn!("接收数据失败: {}", e),
+            Err(CsError::Socket(e)) if e.kind() == ErrorKind::ConnectionReset => {
+                tracing::warn!("连接被重置: {:?}", e)
+            }
+            Err(e) => tracing::warn!("接收数据失败: {:?}", e),
             Ok(None) => {}
             Ok(Some((uid, count))) => match bitcode::decode::<Event>(&buf) {
                 Err(e) => tracing::warn!(
@@ -90,7 +94,7 @@ async fn handle_request<C: Crypto>(
                 }
             }
             tracing::info!(
-                "收到文件请求: {} ({}-{}) {:?}",
+                "收到文件请求: {} ({:x}-{:x}) {:?}",
                 req.path,
                 req.file_id,
                 req.action_id,
@@ -109,6 +113,10 @@ async fn handle_request<C: Crypto>(
                     let mut resp = bitcode::encode(&Event::FileEnd(req.file_id));
                     while let Err(e) = client.send(&mut resp).await {
                         tracing::warn!("发送文件结束标志失败: {:?}", e);
+                        if let CsError::ConnectionBroken = e {
+                            tracing::info!("连接已断开，停止发送文件结束标志");
+                            Err(e)?;
+                        }
                         tokio::time::sleep(Duration::from_millis(100)).await;
                     }
                     return Ok(());
@@ -138,6 +146,10 @@ async fn handle_request<C: Crypto>(
                         let response = Event::AckFile(part);
                         while let Err(e) = client.send(&mut bitcode::encode(&response)).await {
                             tracing::warn!("发送文件块失败 (offset {}): {:?}", curr_pos, e);
+                            if let CsError::ConnectionBroken = e {
+                                tracing::info!("连接已断开，停止发送文件块");
+                                Err(e)?;
+                            }
                             tokio::time::sleep(Duration::from_millis(100)).await;
                         }
                         remaining -= len;
