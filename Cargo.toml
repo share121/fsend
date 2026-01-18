@@ -14,7 +14,10 @@ dashmap = "6.1.0"
 hex = "0.4.3"
 indicatif = "0.18.3"
 mimalloc = "0.1.48"
-mmap-io = { version = "0.9.4", features = ["advise", "hugepages"], default-features = false }
+mmap-io = { version = "0.9.4", default-features = false, features = [
+  "advise",
+  "hugepages"
+] }
 rand = "0.8"
 rpassword = "7.4.0"
 scopeguard = "1.2.0"

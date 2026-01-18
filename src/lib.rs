@@ -12,10 +12,10 @@ pub enum Event {
     Metadata(String),
     AckMetadata(Metadata),
 
-    /// 读取文件 [start, end) 左闭右开
+    /// 读取文件
     File(FileRequest),
     AckFile(FilePart),
-    FileEnd,
+    FileEnd(u64),
 }
 
 #[derive(Encode, Decode, PartialEq, Debug, Clone)]
@@ -26,18 +26,17 @@ pub struct Metadata {
 #[derive(Encode, Decode, PartialEq, Debug, Clone)]
 pub struct FileRequest {
     pub path: String,
-    /// 包含 start
-    pub start: u64,
-    /// 不包含 end
-    pub end: u64,
-    pub fid: u64,
+    /// 左闭右开
+    pub ranges: Vec<(u64, u64)>,
+    pub action_id: u64,
+    pub file_id: u64,
 }
 
 #[derive(Encode, Decode, PartialEq, Debug, Clone)]
 pub struct FilePart {
     pub data: Vec<u8>,
     pub start: u64,
-    pub fid: u64,
+    pub file_id: u64,
 }
 
 pub fn build_socket(addr: SocketAddr) -> std::io::Result<tokio::net::UdpSocket> {

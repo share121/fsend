@@ -1,9 +1,10 @@
 use crate::{
     Event, FilePart, FileRequest, build_socket,
-    progress::{Mergeable, ProgressEntry, invert::invert, merge::Merge},
+    progress::{ProgressEntry, Total, invert::invert, merge::Merge},
 };
 use anyhow::Context;
 use cscall::{
+    CsError,
     client::{Client, ClientConfig},
     crypto::{Crypto, aes256gcm::Aes256GcmCrypto},
 };
@@ -22,7 +23,7 @@ pub async fn handle_connect_mode(addr: &str, path: &Path) -> anyhow::Result<()> 
         Client::<Aes256GcmCrypto>::new(ClientConfig {
             socket,
             target: addr,
-            ttl: Duration::from_secs(10),
+            ttl: Duration::from_secs(60),
             pwd: pwd.as_bytes().into(),
         }),
     )
@@ -35,7 +36,7 @@ pub async fn handle_connect_mode(addr: &str, path: &Path) -> anyhow::Result<()> 
     let meta = loop {
         match client.send(&mut event.clone()).await {
             Err(e) => tracing::warn!("获取元数据失败：{:?}", e),
-            Ok(_) => match client.recv(&mut buf).await {
+            Ok(_) => match client.recv_timeout(&mut buf, Duration::from_secs(10)).await {
                 Err(e) => tracing::warn!("接收元数据失败：{:?}", e),
                 Ok(None) => {}
                 Ok(Some(_)) => match bitcode::decode::<Event>(&buf) {
@@ -82,52 +83,63 @@ pub async fn handle_connect_mode(addr: &str, path: &Path) -> anyhow::Result<()> 
             .unwrap()
             .progress_chars("#>-"),
         );
-    loop {
-        let download_range = match invert(progress.iter(), meta.size).next() {
-            None => break,
-            Some(r) => r,
-        };
-        let fid = OsRng.next_u64();
+    let file_id = OsRng.next_u64();
+    'outer: loop {
+        let download_ranges: Vec<_> = invert(progress.iter(), meta.size, 1024 * 1024)
+            .take(64)
+            .map(|r| (r.start, r.end))
+            .collect();
+        if download_ranges.is_empty() {
+            break;
+        }
+        let action_id = OsRng.next_u64();
         let event = bitcode::encode(&Event::File(FileRequest {
             path: path_str.clone(),
-            start: download_range.start,
-            end: download_range.end,
-            fid,
+            ranges: download_ranges,
+            file_id,
+            action_id,
         }));
         loop {
             match client.send(&mut event.clone()).await {
                 Err(e) => tracing::warn!("获取文件内容失败：{:?}", e),
-                Ok(_) => match get_file(&client, &mut buf, fid).await {
+                Ok(_) => match get_file(&client, &mut buf, file_id, Duration::from_secs(5)).await {
                     Err(e) => tracing::warn!("获取文件内容失败：{:?}", e),
-                    Ok(None) => {}
-                    Ok(Some(part)) => {
+                    Ok(Some(Event::AckFile(part))) => {
+                        let old_total = progress.total();
                         progress.merge_progress(part.start..part.start + part.data.len() as u64);
-                        pb.inc(part.data.len() as u64);
+                        let new_total = progress.total();
+                        pb.inc(new_total - old_total);
                         tx.send(part).context("写入线程异常退出")?;
                         break;
                     }
+                    Ok(Some(Event::FileEnd(_)))
+                        if invert(progress.iter(), meta.size, 0).next().is_none() =>
+                    {
+                        break 'outer;
+                    }
+                    Ok(_) => {}
                 },
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         loop {
-            if progress.iter().any(|p| p.contain(&download_range)) {
-                break;
-            }
-            match tokio::time::timeout(Duration::from_secs(1), get_file(&client, &mut buf, fid))
-                .await
-            {
-                Err(e) => {
-                    tracing::warn!("获取文件内容超时：{:?}", e);
+            match get_file(&client, &mut buf, file_id, Duration::from_secs(1)).await {
+                Err(CsError::RecvTimeout(_)) => {
+                    tracing::warn!("获取文件内容超时");
                     break;
                 }
-                Ok(Err(e)) => tracing::warn!("获取文件内容失败：{:?}", e),
-                Ok(Ok(Some(part))) => {
+                Err(e) => tracing::warn!("获取文件内容失败：{:?}", e),
+                Ok(Some(Event::AckFile(part))) => {
+                    let old_total = progress.total();
                     progress.merge_progress(part.start..part.start + part.data.len() as u64);
-                    pb.inc(part.data.len() as u64);
+                    let new_total = progress.total();
+                    pb.inc(new_total - old_total);
                     tx.send(part).context("写入线程异常退出")?;
                 }
-                Ok(Ok(None)) => {}
+                Ok(Some(Event::FileEnd(_))) => {
+                    break;
+                }
+                Ok(_) => {}
             }
         }
     }
@@ -142,18 +154,38 @@ pub async fn handle_connect_mode(addr: &str, path: &Path) -> anyhow::Result<()> 
 async fn get_file<C: Crypto>(
     client: &Client<C>,
     buf: &mut Vec<u8>,
-    fid: u64,
-) -> anyhow::Result<Option<FilePart>> {
-    let res = client.recv(buf).await.context("接收文件内容失败")?;
+    file_id: u64,
+    timeout: Duration,
+) -> Result<Option<Event>, CsError> {
+    let res = client.recv_timeout(buf, timeout).await?;
     if res.is_none() {
         return Ok(None);
     }
-    let event: Event = bitcode::decode(buf).context("解码文件内容失败")?;
+    let event: Event = bitcode::decode(buf).or(Err(CsError::InvalidFormat))?;
     match event {
-        Event::AckFile(part) if part.fid == fid => Ok(Some(part)),
-        Event::AckFile(part) => {
-            anyhow::bail!("收到错误的 AckFile，期望 fid: {} 但收到：{}", fid, part.fid)
+        Event::AckFile(part) if part.file_id == file_id => Ok(Some(Event::AckFile(part))),
+        Event::FileEnd(recv_file_id) if recv_file_id == file_id => {
+            Ok(Some(Event::FileEnd(recv_file_id)))
         }
-        event => anyhow::bail!("期望收到文件内容 AckFile，但收到：{:?}", event),
+        Event::FileEnd(recv_file_id) => {
+            tracing::warn!(
+                "收到错误的 FileEnd，期望 file_id: {} 但收到：{}",
+                file_id,
+                recv_file_id
+            );
+            Err(CsError::InvalidFormat)
+        }
+        Event::AckFile(part) => {
+            tracing::warn!(
+                "收到错误的 AckFile，期望 file_id: {} 但收到：{}",
+                file_id,
+                part.file_id
+            );
+            Err(CsError::InvalidFormat)
+        }
+        event => {
+            tracing::warn!("期望收到文件内容 AckFile，但收到：{:?}", event);
+            Err(CsError::InvalidFormat)
+        }
     }
 }

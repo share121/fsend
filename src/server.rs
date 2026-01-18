@@ -5,14 +5,14 @@ use cscall::{
     crypto::{Crypto, aes256gcm::Aes256GcmCrypto},
     server::Server,
 };
-use dashmap::DashSet;
+use dashmap::DashMap;
 use mmap_io::{MemoryMappedFile, MmapAdvice, MmapMode};
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
-use tokio::fs;
+use tokio::{fs, task::JoinHandle};
 
 pub async fn handle_serve_mode(serve_root: &Path) -> anyhow::Result<()> {
     let serve_root = fs::canonicalize(&serve_root)
@@ -22,7 +22,7 @@ pub async fn handle_serve_mode(serve_root: &Path) -> anyhow::Result<()> {
     let pwd = rpassword::prompt_password("请输入密码：")?;
     let socket = Arc::new(build_socket("0.0.0.0:8080".parse()?)?);
     let server = Arc::new(Server::<Aes256GcmCrypto>::new(pwd.as_bytes().into(), socket).await?);
-    let fids = Arc::new(DashSet::new());
+    let actions = Arc::new(DashMap::new());
     tracing::info!("服务器启动，服务目录: {}", serve_root.display());
     let mut buf = Vec::with_capacity(1500);
     loop {
@@ -39,10 +39,10 @@ pub async fn handle_serve_mode(serve_root: &Path) -> anyhow::Result<()> {
                 Ok(event) => {
                     let server_clone = server.clone();
                     let root_clone = serve_root.clone();
-                    let fids = fids.clone();
+                    let actions = actions.clone();
                     tokio::spawn(async move {
                         if let Err(e) =
-                            handle_request(server_clone, uid, root_clone, event, fids).await
+                            handle_request(server_clone, uid, root_clone, event, actions).await
                         {
                             tracing::error!(
                                 "处理请求失败 (UID: {}, Count: {}): {:?}",
@@ -58,13 +58,15 @@ pub async fn handle_serve_mode(serve_root: &Path) -> anyhow::Result<()> {
     }
 }
 
+type Action = (u64, JoinHandle<Result<(), anyhow::Error>>);
+
 /// 处理单个客户端请求
 async fn handle_request<C: Crypto>(
     server: Arc<Server<C>>,
     uid: [u8; UID_LEN],
     root: Arc<PathBuf>,
     event: Event,
-    fids: Arc<DashSet<u64>>,
+    actions: Arc<DashMap<u64, Action>>,
 ) -> anyhow::Result<()> {
     let client = server.get(&uid).await.context("找不到客户端连接")?;
     match event {
@@ -80,53 +82,76 @@ async fn handle_request<C: Crypto>(
             client.send(&mut send_buf).await.context("发送元数据失败")?;
         }
         Event::File(req) => {
+            if let Some(action) = actions.get(&req.file_id) {
+                if action.0 == req.action_id {
+                    anyhow::bail!("重复的 action_id")
+                } else {
+                    action.1.abort();
+                }
+            }
             tracing::info!(
-                "收到文件请求: {} ({}) [{}, {})",
+                "收到文件请求: {} ({}-{}) {:?}",
                 req.path,
-                req.fid,
-                req.start,
-                req.end
+                req.file_id,
+                req.action_id,
+                req.ranges,
             );
-            if fids.contains(&req.fid) {
-                anyhow::bail!("重复的 fid")
-            }
-            fids.insert(req.fid);
-            let _ids_guard = scopeguard::guard((), |_| {
-                fids.remove(&req.fid);
-            });
-            let path = secure_resolve_path(&root, &req.path).await?;
-            let file_size = fs::metadata(&path).await?.len();
-            if file_size == 0 {
-                return Ok(());
-            }
-            let mmap = tokio::task::spawn_blocking(move || {
-                MemoryMappedFile::builder(path)
-                    .mode(MmapMode::ReadOnly)
-                    .open()
-            })
-            .await??;
-            let mut remaining = req.end.saturating_sub(req.start).min(file_size);
-            let mut curr_pos = req.start;
-            mmap.advise(curr_pos, remaining, MmapAdvice::Sequential)?;
-            const CHUNK_SIZE: u64 = 1024;
-            while remaining > 0 {
-                let len = CHUNK_SIZE.min(remaining);
-                let part = FilePart {
-                    start: curr_pos,
-                    data: mmap
-                        .as_slice(curr_pos, len)
-                        .context("无法读取文件")?
-                        .to_vec(),
-                    fid: req.fid,
-                };
-                let response = Event::AckFile(part);
-                while let Err(e) = client.send(&mut bitcode::encode(&response)).await {
-                    tracing::warn!("发送文件块失败 (offset {}): {:?}", curr_pos, e);
+            let actions_clone = actions.clone();
+            let handle = tokio::spawn(async move {
+                let _ids_guard = scopeguard::guard((), |_| {
+                    actions_clone.remove_if(&req.file_id, |_, (stored_action_id, _)| {
+                        *stored_action_id == req.action_id
+                    });
+                });
+                let path = secure_resolve_path(&root, &req.path).await?;
+                let file_size = fs::metadata(&path).await?.len();
+                if file_size == 0 {
+                    let mut resp = bitcode::encode(&Event::FileEnd(req.file_id));
+                    while let Err(e) = client.send(&mut resp).await {
+                        tracing::warn!("发送文件结束标志失败: {:?}", e);
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    return Ok(());
+                }
+                let mmap = tokio::task::spawn_blocking(move || {
+                    MemoryMappedFile::builder(path)
+                        .mode(MmapMode::ReadOnly)
+                        .open()
+                })
+                .await??;
+                for range in req.ranges {
+                    let mut curr_pos = range.0;
+                    let actual_end = range.1.min(file_size);
+                    let mut remaining = actual_end.saturating_sub(curr_pos);
+                    mmap.advise(curr_pos, remaining, MmapAdvice::Sequential)?;
+                    const CHUNK_SIZE: u64 = 1024;
+                    while remaining > 0 {
+                        let len = CHUNK_SIZE.min(remaining);
+                        let part = FilePart {
+                            start: curr_pos,
+                            data: mmap
+                                .as_slice(curr_pos, len)
+                                .context("无法读取文件")?
+                                .to_vec(),
+                            file_id: req.file_id,
+                        };
+                        let response = Event::AckFile(part);
+                        while let Err(e) = client.send(&mut bitcode::encode(&response)).await {
+                            tracing::warn!("发送文件块失败 (offset {}): {:?}", curr_pos, e);
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                        remaining -= len;
+                        curr_pos += len;
+                    }
+                }
+                let mut resp = bitcode::encode(&Event::FileEnd(req.file_id));
+                while let Err(e) = client.send(&mut resp).await {
+                    tracing::warn!("发送文件结束标志失败: {:?}", e);
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
-                remaining -= len;
-                curr_pos += len;
-            }
+                Ok(())
+            });
+            actions.insert(req.file_id, (req.action_id, handle));
         }
         _ => tracing::debug!("收到未处理的事件类型: {:?}", event),
     }
@@ -135,7 +160,7 @@ async fn handle_request<C: Crypto>(
 
 /// 安全路径解析：防止目录遍历攻击 (../../)
 async fn secure_resolve_path(root: &Path, req_path: &str) -> anyhow::Result<PathBuf> {
-    let req_path = req_path.trim_start_matches('/');
+    let req_path = req_path.trim_start_matches('/').trim_start_matches('\\');
     let full_path = root.join(req_path);
     let canonical_path = fs::canonicalize(full_path)
         .await

@@ -5,34 +5,41 @@ pub struct InvertIter<'a> {
     iter: Iter<'a, ProgressEntry>,
     prev_end: u64,
     total_size: u64,
+    window: u64,
 }
 
 impl<'a> Iterator for InvertIter<'a> {
     type Item = ProgressEntry;
 
     fn next(&mut self) -> Option<Self::Item> {
+        let mut gap_start = self.prev_end;
         for range in self.iter.by_ref() {
-            if range.start > self.prev_end {
-                let gap = self.prev_end..range.start;
-                self.prev_end = range.end;
-                return Some(gap);
+            if range.start == gap_start {
+                gap_start = range.end;
+                continue;
             }
-            self.prev_end = range.end;
+            let len = range.end - range.start;
+            if len >= self.window {
+                self.prev_end = range.end;
+                return Some(gap_start..range.start);
+            }
         }
-        if self.prev_end < self.total_size {
-            let gap = self.prev_end..self.total_size;
+        if gap_start < self.total_size {
             self.prev_end = self.total_size;
-            return Some(gap);
+            Some(gap_start..self.total_size)
+        } else {
+            None
         }
-        None
     }
 }
 
-pub fn invert(progress: Iter<ProgressEntry>, total_size: u64) -> InvertIter {
+/// window: 当一个 ProgressEntry 的长度小于 window 时，会被合并到空洞内，以减少碎片化进度。
+pub fn invert(progress: Iter<ProgressEntry>, total_size: u64, window: u64) -> InvertIter {
     InvertIter {
         iter: progress,
         prev_end: 0,
         total_size,
+        window,
     }
 }
 
@@ -41,18 +48,18 @@ mod tests {
     #![allow(clippy::single_range_in_vec_init)]
     use super::*;
 
-    // 辅助函数，方便测试时将迭代器转为 Vec 比较
-    fn invert_vec(progress: &[ProgressEntry], total_size: u64) -> Vec<ProgressEntry> {
-        invert(progress.iter(), total_size).collect()
+    fn invert_vec(progress: &[ProgressEntry], total_size: u64, window: u64) -> Vec<ProgressEntry> {
+        invert(progress.iter(), total_size, window).collect()
     }
 
     #[test]
-    fn test_reverse_progress() {
-        assert_eq!(invert_vec(&[], 10), [0..10]);
-        assert_eq!(invert_vec(&[0..5], 10), [5..10]);
-        assert_eq!(invert_vec(&[5..10], 10), [0..5]);
-        assert_eq!(invert_vec(&[0..5, 7..10], 10), [5..7]);
-        assert_eq!(invert_vec(&[0..3, 5..8], 10), [3..5, 8..10]);
-        assert_eq!(invert_vec(&[1..3, 5..8], 10), [0..1, 3..5, 8..10]);
+    fn test_windowed_invert() {
+        assert_eq!(invert_vec(&[10..20], 30, 1), [0..10, 20..30]);
+        assert_eq!(invert_vec(&[10..12], 30, 5), [0..30]);
+        assert_eq!(invert_vec(&[10..20, 25..27], 30, 5), [0..10, 20..30]);
+        assert_eq!(invert_vec(&[10..14, 25..27, 30..32], 50, 5), [0..50]);
+        assert_eq!(invert_vec(&[10..14, 25..49], 50, 5), [0..25, 49..50]);
+        assert_eq!(invert_vec(&[2..4, 6..8, 10..12], 15, 5), [0..15]);
+        assert_eq!(invert_vec(&[0..2, 10..20], 30, 5), [2..10, 20..30]);
     }
 }

@@ -1,4 +1,4 @@
-use crate::progress::{Mergeable, ProgressEntry};
+use crate::progress::ProgressEntry;
 
 pub trait Merge {
     fn merge_progress(&mut self, new: ProgressEntry);
@@ -6,28 +6,29 @@ pub trait Merge {
 
 impl Merge for Vec<ProgressEntry> {
     fn merge_progress(&mut self, new: ProgressEntry) {
-        let i = self.partition_point(|old| old.start < new.start);
+        let i = self.partition_point(|x| x.end < new.start);
         if i == self.len() {
-            match self.last_mut() {
-                Some(last) if last.end == new.start => {
-                    last.end = new.end;
-                }
-                _ => self.push(new),
-            }
-        } else {
-            let u1 = i > 0 && self[i - 1].can_merge(&new);
-            let u2 = self[i].can_merge(&new);
-            if u1 && u2 {
-                self[i - 1].end = self[i].end;
-                self.remove(i);
-            } else if u1 {
-                self[i - 1].end = new.end;
-            } else if u2 {
-                self[i].start = new.start;
-            } else {
-                self.insert(i, new);
-            }
+            self.push(new);
+            return;
         }
+        if self[i].start <= new.start && self[i].end >= new.end {
+            return;
+        }
+        let mut current_merge = new;
+        let mut j = i;
+        while j < self.len() {
+            let entry = &self[j];
+            if entry.start > current_merge.end {
+                break;
+            }
+            current_merge.start = current_merge.start.min(entry.start);
+            current_merge.end = current_merge.end.max(entry.end);
+            j += 1;
+        }
+        if j > i {
+            self.drain(i..j);
+        }
+        self.insert(i, current_merge);
     }
 }
 
@@ -36,48 +37,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_merge_into_empty_vec() {
-        let mut v: Vec<ProgressEntry> = Vec::new();
+    fn test_merge() {
+        #[allow(clippy::single_range_in_vec_init)]
+        let mut v = vec![1..5, 8..10];
+        v.merge_progress(5..10);
+        assert_eq!(v, vec![1..10]);
         v.merge_progress(10..20);
-        assert_eq!(v, vec![10..20]);
-    }
-
-    #[test]
-    fn test_append_non_overlapping() {
-        #[allow(clippy::single_range_in_vec_init)]
-        let mut v = vec![1..5];
-        v.merge_progress(6..10);
-        assert_eq!(v, vec![1..5, 6..10]);
-    }
-
-    #[test]
-    fn test_prepend_non_overlapping() {
-        #[allow(clippy::single_range_in_vec_init)]
-        let mut v = vec![6..10];
-        v.merge_progress(1..5);
-        assert_eq!(v, vec![1..5, 6..10]);
-    }
-
-    #[test]
-    fn test_merge_with_last() {
-        #[allow(clippy::single_range_in_vec_init)]
-        let mut v = vec![1..5];
-        v.merge_progress(5..10);
-        assert_eq!(v, vec![1..10]);
-    }
-
-    #[test]
-    fn test_insert_between_two() {
-        let mut v = vec![1..5, 10..15];
-        v.merge_progress(6..8);
-        assert_eq!(v, vec![1..5, 6..8, 10..15]);
-    }
-
-    #[test]
-    fn test_merge_adjacent() {
-        #[allow(clippy::single_range_in_vec_init)]
-        let mut v = vec![1..5];
-        v.merge_progress(5..10);
-        assert_eq!(v, vec![1..10]);
+        assert_eq!(v, vec![1..20]);
+        v.merge_progress(30..40);
+        assert_eq!(v, vec![1..20, 30..40]);
+        v.merge_progress(21..40);
+        assert_eq!(v, vec![1..20, 21..40]);
+        v.merge_progress(19..21);
+        assert_eq!(v, vec![1..40]);
+        v.merge_progress(50..60);
+        assert_eq!(v, vec![1..40, 50..60]);
+        v.merge_progress(50..60);
+        assert_eq!(v, vec![1..40, 50..60]);
+        v.merge_progress(52..60);
+        assert_eq!(v, vec![1..40, 50..60]);
+        v.merge_progress(52..53);
+        assert_eq!(v, vec![1..40, 50..60]);
+        v.merge_progress(52..61);
+        assert_eq!(v, vec![1..40, 50..61]);
+        v.merge_progress(62..70);
+        assert_eq!(v, vec![1..40, 50..61, 62..70]);
+        v.merge_progress(40..62);
+        assert_eq!(v, vec![1..70]);
     }
 }
